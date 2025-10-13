@@ -1021,103 +1021,56 @@ if systemctl list-unit-files | grep -q "cloudflared.service"; then
     sleep 2
 fi
 
-# Remove conflicting config in home directory
-if [[ -f "/root/.cloudflared/config.yml" ]] && [[ -f "/etc/cloudflared/config.yml" ]]; then
-    print_info "Removing conflicting config in /root/.cloudflared/"
-    mv /root/.cloudflared/config.yml /root/.cloudflared/config.yml.backup 2>/dev/null || true
-fi
-
-# Move config to system location
+# --- START: ROBUST CONFIGURATION HANDLING ---
 mkdir -p /etc/cloudflared
 
-# Move the newly created config file from Step 10 and forcefully overwrite any old version.
-# This single command replaces the previous faulty logic.
-mv -f /root/.cloudflared/config.yml /etc/cloudflared/config.yml
+# Check if a new config was generated during this run
+if [[ -f "/root/.cloudflared/config.yml" ]]; then
+    print_info "New configuration found. Moving it to the system directory..."
+    # Move the new file and overwrite any old one
+    mv -f /root/.cloudflared/config.yml /etc/cloudflared/config.yml
+    
+    # Also copy the new credentials file and update the config path
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        cp "$CREDENTIALS_FILE" /etc/cloudflared/
+        sed -i "s|/root/.cloudflared/|/etc/cloudflared/|g" /etc/cloudflared/config.yml
+    fi
+elif [[ ! -f "/etc/cloudflared/config.yml" ]]; then
+    # If NO new config was made AND NO old config exists, we cannot proceed.
+    error_exit "FATAL: Cannot find config.yml in /root/.cloudflared or /etc/cloudflared. Cannot configure service."
+else
+    print_info "Using existing configuration found in /etc/cloudflared/."
+fi
+# --- END: ROBUST CONFIGURATION HANDLING ---
 
-# Copy the corresponding credentials file.
-cp "$CREDENTIALS_FILE" /etc/cloudflared/
-
-# Update the path inside the config file to point to the new credentials location.
-sed -i "s|/root/.cloudflared/|/etc/cloudflared/|g" /etc/cloudflared/config.yml
-
-# Verify config file is valid
+# Verify config file is valid before proceeding
 if [[ ! -f "/etc/cloudflared/config.yml" ]]; then
-    error_exit "Config file missing in /etc/cloudflared/"
+    error_exit "Config file missing in /etc/cloudflared/. Cannot install service."
 fi
 
 print_info "Installing cloudflared service..."
-
-# Install service with explicit config path
 if cloudflared --config /etc/cloudflared/config.yml service install 2>&1 | tee -a "$LOG_FILE"; then
     print_success "Service installed successfully"
 else
-    print_warning "Service installation had issues, trying alternative method..."
-
-    # Alternative: Create systemd service manually
-    print_info "Creating systemd service manually..."
-
-    cat > /etc/systemd/system/cloudflared.service <<EOF
-[Unit]
-Description=cloudflared
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/cloudflared --config /etc/cloudflared/config.yml tunnel run
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    print_success "Systemd service created manually"
+    print_warning "Service installation failed. Check logs for details."
 fi
 
 # Enable and start service
 print_info "Enabling and starting cloudflared service..."
-
-systemctl daemon-reload 2>/dev/null || true
-systemctl enable cloudflared 2>&1 | tee -a "$LOG_FILE" || print_warning "Enable may have failed"
-systemctl restart cloudflared 2>&1 | tee -a "$LOG_FILE" || print_warning "Restart may have failed"
+systemctl daemon-reload
+systemctl enable cloudflared
+systemctl restart cloudflared
 
 sleep 5
 
 # Check service status
 if systemctl is-active --quiet cloudflared; then
     print_success "Cloudflare Tunnel service is running!"
-
-    # Show tunnel info
-    sleep 2
-    if journalctl -u cloudflared -n 10 2>/dev/null | grep -qi "connection.*registered\|registered.*connection\|tunnel.*running"; then
-        print_success "Tunnel is connected!"
-    fi
 else
     print_warning "Service may not be running correctly."
-    echo
-    print_info "Checking service status..."
-    systemctl status cloudflared --no-pager -l | tail -20
-    echo
-    print_info "Checking tunnel logs..."
-    journalctl -u cloudflared -n 20 --no-pager
-    echo
-
-    read -p "Service isn't running. Try to start manually? (y/N): " manual_start
-    if [[ "$manual_start" =~ ^[Yy]$ ]]; then
-        print_info "Attempting manual start..."
-        systemctl start cloudflared
-        sleep 3
-
-        if systemctl is-active --quiet cloudflared; then
-            print_success "Service started successfully!"
-        else
-            print_error "Could not start service. Manual intervention needed."
-            print_info "Try: sudo cloudflared --config /etc/cloudflared/config.yml tunnel run"
-        fi
-    fi
+    print_info "Run 'sudo journalctl -u cloudflared -f' to check logs."
 fi
+
 
 # --- STEP 13: Update WordPress URLs ---
 save_state "wordpress_config"
