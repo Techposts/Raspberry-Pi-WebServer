@@ -1030,21 +1030,14 @@ fi
 # Move config to system location
 mkdir -p /etc/cloudflared
 
-# Copy config file
-if [[ -f "/root/.cloudflared/config.yml" ]]; then
-    cp /root/.cloudflared/config.yml /etc/cloudflared/config.yml
-elif [[ ! -f "/etc/cloudflared/config.yml" ]]; then
-    print_warning "Config file not found, this shouldn't happen!"
-fi
+# Move the newly created config file from Step 10 and forcefully overwrite any old version.
+# This single command replaces the previous faulty logic.
+mv -f /root/.cloudflared/config.yml /etc/cloudflared/config.yml
 
-# Copy credentials file
-if [[ -f "$CREDENTIALS_FILE" ]]; then
-    cp "$CREDENTIALS_FILE" /etc/cloudflared/
-else
-    error_exit "Credentials file not found: $CREDENTIALS_FILE"
-fi
+# Copy the corresponding credentials file.
+cp "$CREDENTIALS_FILE" /etc/cloudflared/
 
-# Update config path to point to /etc/cloudflared
+# Update the path inside the config file to point to the new credentials location.
 sed -i "s|/root/.cloudflared/|/etc/cloudflared/|g" /etc/cloudflared/config.yml
 
 # Verify config file is valid
