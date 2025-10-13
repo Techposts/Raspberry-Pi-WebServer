@@ -126,7 +126,7 @@ ssh pi@YOUR_PI_IP_ADDRESS
 Copy and paste these commands one at a time:
 
 ```bash
-wget https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/wordpress-cloudflare-pi/main/PiWebServer_V2.sh && chmod +x PiWebServer_V2.sh && sudo ./PiWebServer_V2.sh
+wget https://raw.githubusercontent.com/Techposts/Raspberry-Pi-WebServer/main/Scripts/PiWebServer_V2.sh && chmod +x PiWebServer_V2.sh && sudo ./PiWebServer_V2.sh
 ```
 
 ### Step 3: Follow the Prompts
