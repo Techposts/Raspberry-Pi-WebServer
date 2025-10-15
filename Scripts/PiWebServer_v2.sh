@@ -902,6 +902,9 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
     # Configure Apache Virtual Host for WordPress
     print_info "Configuring Apache Virtual Host for WordPress..."
     
+    # Backup existing Apache config
+    backup_file "/etc/apache2/sites-available/000-default.conf"
+    
     cat > /etc/apache2/sites-available/000-default.conf <<'APACHECONF'
 <VirtualHost *:80>
     ServerAdmin webmaster@localhost
@@ -911,17 +914,13 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
         Options -Indexes +FollowSymLinks
         AllowOverride All
         Require all granted
-        
-        # Ensure index.php is processed first
         DirectoryIndex index.php index.html index.htm
         
-        # Enable PHP processing
         <FilesMatch \.php$>
             SetHandler application/x-httpd-php
         </FilesMatch>
     </Directory>
 
-    # WordPress permalinks support
     <IfModule mod_rewrite.c>
         RewriteEngine On
         RewriteBase /
@@ -955,22 +954,39 @@ HTACCESS
     chown www-data:www-data /var/www/html/.htaccess
     chmod 644 /var/www/html/.htaccess
 
-    # Enable the site configuration
-    a2ensite 000-default 2>/dev/null || true
-    
-    # Restart Apache with new configuration
-    systemctl restart apache2
-    sleep 3
+    # Validate and apply Apache configuration
+    print_info "Validating Apache configuration..."
+    if apache2ctl configtest > /dev/null 2>&1; then
+        print_success "Apache configuration is valid"
+        
+        # Enable the site configuration
+        a2ensite 000-default 2>/dev/null || true
+        
+        # Restart Apache with new configuration
+        if systemctl restart apache2; then
+            print_success "Apache restarted successfully"
+            sleep 3
+        else
+            print_error "Apache restart failed!"
+            error_exit "Could not restart Apache. Check: sudo journalctl -xe"
+        fi
+    else
+        print_error "Apache configuration validation failed!"
+        apache2ctl configtest 2>&1 | tee -a "$LOG_FILE"
+        error_exit "Invalid Apache configuration. Please review the error above."
+    fi
 
     # Final verification that PHP works with WordPress
     print_info "Verifying WordPress and PHP configuration..."
+    sleep 2
     
-    local verification_result=$(curl -s http://localhost 2>/dev/null || echo "FAILED")
+    verification_result=$(curl -s http://localhost 2>/dev/null || echo "FAILED")
     
     if echo "$verification_result" | grep -q "<?php"; then
         print_error "PHP is NOT being processed! Attempting emergency fix..."
         
         # Emergency fix - reinstall PHP module
+        print_info "Reinstalling PHP Apache module..."
         apt-get install --reinstall libapache2-mod-php${PHP_VERSION} -y 2>&1 | tee -a "$LOG_FILE"
         
         # Ensure PHP module is enabled
@@ -986,7 +1002,10 @@ HTACCESS
         verification_result=$(curl -s http://localhost 2>/dev/null || echo "FAILED")
         if echo "$verification_result" | grep -q "<?php"; then
             print_error "PHP configuration still failing!"
-            print_error "Please check Apache error log: sudo tail -f /var/log/apache2/error.log"
+            print_error "Manual steps needed:"
+            echo "  1. Check PHP module: apache2ctl -M | grep php"
+            echo "  2. Check Apache error log: sudo tail -f /var/log/apache2/error.log"
+            echo "  3. Test PHP: echo '<?php phpinfo(); ?>' | sudo tee /var/www/html/test.php"
             error_exit "PHP not processing correctly. Manual intervention required."
         else
             print_success "Emergency fix successful - PHP is now working!"
@@ -997,15 +1016,21 @@ HTACCESS
         print_success "WordPress is loading (database connection will be configured during setup)"
     else
         print_warning "WordPress response unclear, but continuing..."
+        print_info "Response preview: ${verification_result:0:200}"
     fi
 
     print_success "WordPress installed successfully!"
+
 else
     print_step "6" "Skipping WordPress (already installed)"
+    
+    # Backup current Apache config before modifying
+    backup_file "/etc/apache2/sites-available/000-default.conf"
     
     # Still update Apache configuration even if WordPress exists
     print_info "Updating Apache configuration for existing WordPress..."
     
+    # Create the configuration file
     cat > /etc/apache2/sites-available/000-default.conf <<'APACHECONF'
 <VirtualHost *:80>
     ServerAdmin webmaster@localhost
@@ -1015,7 +1040,6 @@ else
         Options -Indexes +FollowSymLinks
         AllowOverride All
         Require all granted
-        
         DirectoryIndex index.php index.html index.htm
         
         <FilesMatch \.php$>
@@ -1037,8 +1061,58 @@ else
 </VirtualHost>
 APACHECONF
 
-    a2ensite 000-default 2>/dev/null || true
-    systemctl restart apache2
+    # Validate Apache configuration before restarting
+    print_info "Validating Apache configuration..."
+    if apache2ctl configtest > /dev/null 2>&1; then
+        print_success "Apache configuration is valid"
+        a2ensite 000-default 2>/dev/null || true
+        
+        # Restart Apache
+        if systemctl restart apache2; then
+            print_success "Apache restarted successfully"
+            sleep 2
+        else
+            print_error "Apache restart failed"
+            print_info "Attempting to restore backup configuration..."
+            
+            # Restore from backup
+            if ls $BACKUP_DIR/000-default.conf.backup.* 1> /dev/null 2>&1; then
+                latest_backup=$(ls -t $BACKUP_DIR/000-default.conf.backup.* | head -1)
+                cp "$latest_backup" /etc/apache2/sites-available/000-default.conf
+                print_info "Restored backup: $latest_backup"
+                
+                if systemctl restart apache2; then
+                    print_warning "Apache restored with old configuration"
+                else
+                    error_exit "Apache cannot start. Check logs: sudo journalctl -xe"
+                fi
+            else
+                error_exit "Could not configure Apache and no backup found. Check: sudo journalctl -xe"
+            fi
+        fi
+    else
+        print_error "Apache configuration validation failed!"
+        apache2ctl configtest 2>&1 | tee -a "$LOG_FILE"
+        
+        print_warning "Skipping Apache configuration update - keeping existing config"
+        
+        # Try to restart with existing config
+        if systemctl restart apache2; then
+            print_warning "Apache restarted with existing configuration"
+        else
+            print_error "Apache failed to start"
+            error_exit "Apache service failed. Check: sudo systemctl status apache2"
+        fi
+    fi
+    
+    # Verify PHP is still working
+    print_info "Verifying PHP configuration..."
+    sleep 2
+    if test_php_apache; then
+        print_success "PHP is working correctly"
+    else
+        print_warning "PHP test inconclusive - may need manual configuration"
+    fi
 fi
 
 # --- STEP 7: Install Cloudflared ---
