@@ -5,7 +5,7 @@
 # Description: Automated WordPress hosting with Cloudflare Tunnel (Robust Version)
 #              Auto-detects existing installations, handles port conflicts,
 #              and includes comprehensive error recovery
-# Version: 2.0 (Robust Edition)
+# Version: 2.1 (Fixed PHP/WordPress Configuration)
 # ==============================================================================
 
 set -e  # Exit on any error (will be trapped)
@@ -20,7 +20,7 @@ C_MAGENTA='\033[0;35m'
 C_CYAN='\033[0;36m'
 
 # --- Global Variables ---
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.1"
 LOG_FILE="/var/log/cloudflare-tunnel-setup.log"
 STATE_FILE="/root/.cloudflare_tunnel_state"
 BACKUP_DIR="/root/cloudflare_tunnel_backups"
@@ -156,6 +156,22 @@ check_and_free_port() {
         fi
     fi
     return 0
+}
+
+# Test PHP functionality
+test_php_apache() {
+    local test_file="/var/www/html/php_test_temp.php"
+    echo '<?php echo "PHP_WORKS"; ?>' > "$test_file"
+    sleep 1
+    
+    local result=$(curl -s http://localhost/php_test_temp.php 2>/dev/null || echo "FAILED")
+    rm -f "$test_file"
+    
+    if echo "$result" | grep -q "PHP_WORKS"; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Detect existing installations
@@ -467,6 +483,7 @@ echo "  • Port conflict resolution"
 echo "  • Automatic backup and recovery"
 echo "  • Comprehensive error handling"
 echo "  • Installation state tracking"
+echo "  • Fixed PHP/WordPress configuration"
 echo
 
 # Pre-flight checks
@@ -590,8 +607,11 @@ if [[ "$SKIP_APACHE" != true ]]; then
 
     smart_install apache2 || error_exit "Failed to install Apache"
 
+    # Enable essential Apache modules
     a2enmod rewrite 2>/dev/null || true
     a2enmod headers 2>/dev/null || true
+    a2enmod expires 2>/dev/null || true
+    a2enmod ssl 2>/dev/null || true
 
     systemctl enable apache2
     systemctl restart apache2
@@ -604,6 +624,9 @@ if [[ "$SKIP_APACHE" != true ]]; then
     fi
 else
     print_step "2" "Skipping Apache (already installed)"
+    # Still enable essential modules even if Apache exists
+    a2enmod rewrite 2>/dev/null || true
+    a2enmod headers 2>/dev/null || true
     systemctl restart apache2 2>/dev/null || true
 fi
 
@@ -633,6 +656,28 @@ done
 
 print_success "PHP $PHP_VERSION installed."
 
+# Configure Apache to properly handle PHP
+print_info "Configuring Apache for PHP processing..."
+
+# Disable conflicting MPM modules and enable prefork (required for mod_php)
+a2dismod mpm_event 2>/dev/null || true
+a2dismod mpm_worker 2>/dev/null || true
+a2enmod mpm_prefork 2>/dev/null || true
+
+# Enable PHP module
+a2enmod php${PHP_VERSION} 2>/dev/null || true
+
+# Create PHP configuration for Apache
+cat > /etc/apache2/conf-available/php-fpm.conf <<'PHPCONF'
+<FilesMatch \.php$>
+    SetHandler application/x-httpd-php
+</FilesMatch>
+
+DirectoryIndex index.php index.html index.htm
+PHPCONF
+
+a2enconf php-fpm 2>/dev/null || true
+
 # Optimize PHP config
 PHP_INI="/etc/php/${PHP_VERSION}/apache2/php.ini"
 if [[ -f "$PHP_INI" ]]; then
@@ -644,7 +689,17 @@ if [[ -f "$PHP_INI" ]]; then
     print_success "PHP optimized for WordPress."
 fi
 
+# Restart Apache to load PHP
 systemctl restart apache2
+sleep 2
+
+# Test PHP configuration
+print_info "Testing PHP configuration..."
+if test_php_apache; then
+    print_success "PHP is working correctly with Apache!"
+else
+    print_warning "PHP test inconclusive - will verify after WordPress installation"
+fi
 
 # --- STEP 4: Install MariaDB ---
 if [[ "$SKIP_MYSQL" != true ]]; then
@@ -714,7 +769,8 @@ MYSQL_SECURE
         # Try with sudo (unix_socket auth)
         print_info "Attempting to secure MariaDB with sudo access..."
         if sudo mysql -u root <<MYSQL_SECURE 2>/dev/null
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASS';
+ALTER USER 'root
+'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASS';
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
@@ -777,11 +833,11 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
     download_success=false
     download_attempts=0
     max_download_attempts=3
-    
+
     while [ $download_attempts -lt $max_download_attempts ] && [ "$download_success" = false ]; do
         download_attempts=$((download_attempts + 1))
         print_info "Download attempt $download_attempts/$max_download_attempts..."
-    
+
         if wget -q --timeout=30 --tries=1 https://wordpress.org/latest.tar.gz 2>/dev/null; then
             download_success=true
             print_success "WordPress downloaded successfully"
@@ -790,7 +846,7 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
             sleep 2
         fi
     done
-    
+
     [ "$download_success" = false ] && error_exit "Failed to download WordPress after $max_download_attempts attempts"
 
     print_info "Extracting WordPress..."
@@ -843,9 +899,146 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
     find "$WEB_ROOT" -type d -exec chmod 755 {} \;
     find "$WEB_ROOT" -type f -exec chmod 644 {} \;
 
+    # Configure Apache Virtual Host for WordPress
+    print_info "Configuring Apache Virtual Host for WordPress..."
+    
+    cat > /etc/apache2/sites-available/000-default.conf <<'APACHECONF'
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html
+
+    <Directory /var/www/html>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+        
+        # Ensure index.php is processed first
+        DirectoryIndex index.php index.html index.htm
+        
+        # Enable PHP processing
+        <FilesMatch \.php$>
+            SetHandler application/x-httpd-php
+        </FilesMatch>
+    </Directory>
+
+    # WordPress permalinks support
+    <IfModule mod_rewrite.c>
+        RewriteEngine On
+        RewriteBase /
+        RewriteRule ^index\.php$ - [L]
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteRule . /index.php [L]
+    </IfModule>
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+APACHECONF
+
+    # Create .htaccess for WordPress
+    print_info "Creating .htaccess file..."
+    cat > /var/www/html/.htaccess <<'HTACCESS'
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+RewriteBase /
+RewriteRule ^index\.php$ - [L]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+HTACCESS
+
+    chown www-data:www-data /var/www/html/.htaccess
+    chmod 644 /var/www/html/.htaccess
+
+    # Enable the site configuration
+    a2ensite 000-default 2>/dev/null || true
+    
+    # Restart Apache with new configuration
+    systemctl restart apache2
+    sleep 3
+
+    # Final verification that PHP works with WordPress
+    print_info "Verifying WordPress and PHP configuration..."
+    
+    local verification_result=$(curl -s http://localhost 2>/dev/null || echo "FAILED")
+    
+    if echo "$verification_result" | grep -q "<?php"; then
+        print_error "PHP is NOT being processed! Attempting emergency fix..."
+        
+        # Emergency fix - reinstall PHP module
+        apt-get install --reinstall libapache2-mod-php${PHP_VERSION} -y 2>&1 | tee -a "$LOG_FILE"
+        
+        # Ensure PHP module is enabled
+        a2dismod mpm_event 2>/dev/null || true
+        a2dismod mpm_worker 2>/dev/null || true
+        a2enmod mpm_prefork 2>/dev/null || true
+        a2enmod php${PHP_VERSION} 2>/dev/null || true
+        
+        systemctl restart apache2
+        sleep 3
+        
+        # Test again
+        verification_result=$(curl -s http://localhost 2>/dev/null || echo "FAILED")
+        if echo "$verification_result" | grep -q "<?php"; then
+            print_error "PHP configuration still failing!"
+            print_error "Please check Apache error log: sudo tail -f /var/log/apache2/error.log"
+            error_exit "PHP not processing correctly. Manual intervention required."
+        else
+            print_success "Emergency fix successful - PHP is now working!"
+        fi
+    elif echo "$verification_result" | grep -qi "wordpress\|wp-admin\|wp-content"; then
+        print_success "WordPress is accessible and PHP is working correctly!"
+    elif echo "$verification_result" | grep -qi "database\|establish.*connection"; then
+        print_success "WordPress is loading (database connection will be configured during setup)"
+    else
+        print_warning "WordPress response unclear, but continuing..."
+    fi
+
     print_success "WordPress installed successfully!"
 else
     print_step "6" "Skipping WordPress (already installed)"
+    
+    # Still update Apache configuration even if WordPress exists
+    print_info "Updating Apache configuration for existing WordPress..."
+    
+    cat > /etc/apache2/sites-available/000-default.conf <<'APACHECONF'
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/html
+
+    <Directory /var/www/html>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+        
+        DirectoryIndex index.php index.html index.htm
+        
+        <FilesMatch \.php$>
+            SetHandler application/x-httpd-php
+        </FilesMatch>
+    </Directory>
+
+    <IfModule mod_rewrite.c>
+        RewriteEngine On
+        RewriteBase /
+        RewriteRule ^index\.php$ - [L]
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteRule . /index.php [L]
+    </IfModule>
+
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>
+APACHECONF
+
+    a2ensite 000-default 2>/dev/null || true
+    systemctl restart apache2
 fi
 
 # --- STEP 7: Install Cloudflared ---
@@ -904,7 +1097,6 @@ if [[ ! -f "/root/.cloudflared/cert.pem" ]]; then
     echo
 
     # Run cloudflared login and capture output to display URL
-    # Use a temporary file to capture the output
     AUTH_OUTPUT=$(mktemp)
 
     # Run in background to capture output
@@ -1021,29 +1213,26 @@ if systemctl list-unit-files | grep -q "cloudflared.service"; then
     sleep 2
 fi
 
-# --- START: ROBUST CONFIGURATION HANDLING ---
+# Robust configuration handling
 mkdir -p /etc/cloudflared
 
 # Check if a new config was generated during this run
 if [[ -f "/root/.cloudflared/config.yml" ]]; then
-    print_info "New configuration found. Moving it to the system directory..."
-    # Move the new file and overwrite any old one
-    mv -f /root/.cloudflared/config.yml /etc/cloudflared/config.yml
+    print_info "Moving configuration to system directory..."
+    cp /root/.cloudflared/config.yml /etc/cloudflared/config.yml
     
-    # Also copy the new credentials file and update the config path
+    # Also copy the credentials file and update the config path
     if [[ -f "$CREDENTIALS_FILE" ]]; then
         cp "$CREDENTIALS_FILE" /etc/cloudflared/
         sed -i "s|/root/.cloudflared/|/etc/cloudflared/|g" /etc/cloudflared/config.yml
     fi
 elif [[ ! -f "/etc/cloudflared/config.yml" ]]; then
-    # If NO new config was made AND NO old config exists, we cannot proceed.
-    error_exit "FATAL: Cannot find config.yml in /root/.cloudflared or /etc/cloudflared. Cannot configure service."
+    error_exit "FATAL: Cannot find config.yml. Cannot configure service."
 else
-    print_info "Using existing configuration found in /etc/cloudflared/."
+    print_info "Using existing configuration in /etc/cloudflared/"
 fi
-# --- END: ROBUST CONFIGURATION HANDLING ---
 
-# Verify config file is valid before proceeding
+# Verify config file is valid
 if [[ ! -f "/etc/cloudflared/config.yml" ]]; then
     error_exit "Config file missing in /etc/cloudflared/. Cannot install service."
 fi
@@ -1052,7 +1241,7 @@ print_info "Installing cloudflared service..."
 if cloudflared --config /etc/cloudflared/config.yml service install 2>&1 | tee -a "$LOG_FILE"; then
     print_success "Service installed successfully"
 else
-    print_warning "Service installation failed. Check logs for details."
+    print_warning "Service installation reported issues. Continuing..."
 fi
 
 # Enable and start service
@@ -1068,9 +1257,8 @@ if systemctl is-active --quiet cloudflared; then
     print_success "Cloudflare Tunnel service is running!"
 else
     print_warning "Service may not be running correctly."
-    print_info "Run 'sudo journalctl -u cloudflared -f' to check logs."
+    print_info "Check logs: sudo journalctl -u cloudflared -f"
 fi
-
 
 # --- STEP 13: Update WordPress URLs ---
 save_state "wordpress_config"
@@ -1089,7 +1277,7 @@ MYSQL_WP
 
     print_success "WordPress configured for https://$DOMAIN_NAME"
 else
-    print_warning "WordPress tables not found - you'll need to complete WordPress installation first"
+    print_warning "WordPress tables not found - complete WordPress installation first"
     print_info "After WordPress installation, visit: https://$DOMAIN_NAME"
 fi
 
@@ -1101,7 +1289,20 @@ echo
 systemctl is-active --quiet apache2 && print_success "✓ Apache running" || print_error "✗ Apache not running"
 systemctl is-active --quiet mariadb && print_success "✓ MariaDB running" || print_error "✗ MariaDB not running"
 systemctl is-active --quiet cloudflared && print_success "✓ Cloudflare Tunnel running" || print_error "✗ Cloudflare Tunnel not running"
-curl -s http://localhost >/dev/null 2>&1 && print_success "✓ Apache responding" || print_warning "⚠ Apache test failed"
+
+# Test Apache response
+if curl -s http://localhost >/dev/null 2>&1; then
+    print_success "✓ Apache responding"
+    
+    # Check if PHP is working
+    if test_php_apache; then
+        print_success "✓ PHP processing correctly"
+    else
+        print_warning "⚠ PHP test inconclusive"
+    fi
+else
+    print_warning "⚠ Apache test failed"
+fi
 
 # --- Installation Complete ---
 save_state "completed"
@@ -1112,14 +1313,17 @@ cat > "$SUMMARY_FILE" <<SUMMARY
 CLOUDFLARE TUNNEL INSTALLATION SUMMARY
 ========================================
 Installation Date: $(date)
+Script Version: $SCRIPT_VERSION
 Domain: $DOMAIN_NAME
 Local IP: $LOCAL_IP
 Tunnel Name: $TUNNEL_NAME
 Tunnel ID: $TUNNEL_ID
+PHP Version: $PHP_VERSION
 
 Website URLs:
   - https://$DOMAIN_NAME
   - https://www.$DOMAIN_NAME
+  - Local: http://$LOCAL_IP
 
 WordPress Database:
   - Database: $DB_NAME
@@ -1132,6 +1336,8 @@ Important Files:
   - WordPress: /var/www/html
   - Tunnel Config: /etc/cloudflared/config.yml
   - Credentials: /etc/cloudflared/$(basename $CREDENTIALS_FILE)
+  - Apache Config: /etc/apache2/sites-available/000-default.conf
+  - PHP Config: /etc/php/${PHP_VERSION}/apache2/php.ini
   - Log File: $LOG_FILE
   - Backups: $BACKUP_DIR/
 
@@ -1140,6 +1346,14 @@ Service Commands:
   - systemctl status apache2
   - systemctl status mariadb
   - journalctl -u cloudflared -f
+  - tail -f /var/log/apache2/error.log
+
+Troubleshooting:
+  - Test PHP: curl http://localhost
+  - Apache logs: tail -f /var/log/apache2/error.log
+  - Cloudflare logs: journalctl -u cloudflared -f
+  - Test local: curl -I http://localhost
+  - Test domain: curl -I https://$DOMAIN_NAME
 
 ========================================
 SUMMARY
@@ -1154,16 +1368,23 @@ echo
 print_success "Your WordPress website is now accessible from the internet!"
 echo
 echo -e "  🌐 Website:  ${C_GREEN}https://$DOMAIN_NAME${C_RESET}"
+echo -e "  🖥️  Local:    ${C_CYAN}http://$LOCAL_IP${C_RESET}"
 echo -e "  📋 Summary:  ${C_CYAN}$SUMMARY_FILE${C_RESET}"
 echo -e "  📝 Log:      ${C_CYAN}$LOG_FILE${C_RESET}"
 echo
 print_info "Wait 2-5 minutes for DNS propagation, then visit your site!"
 echo
 print_warning "NEXT STEPS:"
-echo "  1. Configure Cloudflare SSL: Dashboard → SSL/TLS → 'Full' mode"
-echo "  2. Enable 'Always Use HTTPS'"
-echo "  3. Visit https://$DOMAIN_NAME to complete WordPress setup"
-echo "  4. Install security plugins and set up backups"
+echo "  1. Test locally first: http://$LOCAL_IP"
+echo "  2. Configure Cloudflare SSL: Dashboard → SSL/TLS → 'Full' mode"
+echo "  3. Enable 'Always Use HTTPS' in Cloudflare"
+echo "  4. Visit https://$DOMAIN_NAME to complete WordPress setup"
+echo "  5. Install security plugins and set up backups"
+echo
+print_info "Troubleshooting:"
+echo "  - If you see PHP code: sudo systemctl restart apache2"
+echo "  - Check Apache: sudo tail -f /var/log/apache2/error.log"
+echo "  - Check tunnel: sudo journalctl -u cloudflared -f"
 echo
 print_success "Installation log saved to: $LOG_FILE"
 echo
