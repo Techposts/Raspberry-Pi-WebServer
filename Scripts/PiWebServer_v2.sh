@@ -774,14 +774,14 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
 
     # Download WordPress with retry logic
     print_info "Downloading WordPress..."
-    local download_success=false
-    local download_attempts=0
-    local max_download_attempts=3
-
+    download_success=false
+    download_attempts=0
+    max_download_attempts=3
+    
     while [ $download_attempts -lt $max_download_attempts ] && [ "$download_success" = false ]; do
         download_attempts=$((download_attempts + 1))
         print_info "Download attempt $download_attempts/$max_download_attempts..."
-
+    
         if wget -q --timeout=30 --tries=1 https://wordpress.org/latest.tar.gz 2>/dev/null; then
             download_success=true
             print_success "WordPress downloaded successfully"
@@ -790,7 +790,7 @@ if [[ "$SKIP_WORDPRESS" != true ]] || [[ ! -f "/var/www/html/wp-config.php" ]]; 
             sleep 2
         fi
     done
-
+    
     [ "$download_success" = false ] && error_exit "Failed to download WordPress after $max_download_attempts attempts"
 
     print_info "Extracting WordPress..."
